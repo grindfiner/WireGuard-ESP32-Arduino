@@ -79,7 +79,10 @@ static struct wireguard_peer *peer_lookup_by_allowed_ip(struct wireguard_device 
 		{
 			for (y = 0; y < WIREGUARD_MAX_SRC_IPS; y++)
 			{
-				if ((tmp->allowed_source_ips[y].valid) && ip_addr_netcmp(ipaddr, &tmp->allowed_source_ips[y].ip, ip_2_ip4(&tmp->allowed_source_ips[y].mask)))
+				if ((tmp->allowed_source_ips[y].valid) &&
+					IP_IS_V4(ipaddr) &&
+					IP_IS_V4(&tmp->allowed_source_ips[y].ip) &&
+					ip_addr_netcmp(ipaddr, &tmp->allowed_source_ips[y].ip, ip_2_ip4(&tmp->allowed_source_ips[y].mask)))
 				{
 					result = tmp;
 					break;
@@ -98,14 +101,20 @@ static bool wireguardif_can_send_initiation(struct wireguard_peer *peer)
 static err_t wireguardif_peer_output(struct netif *netif, struct pbuf *q, struct wireguard_peer *peer)
 {
 	struct wireguard_device *device = (struct wireguard_device *)netif->state;
-	// Send to last know port, not the connect port
-	// TODO: Support DSCP and ECN - lwip requires this set on PCB globally, not per packet
-	return udp_sendto_if(device->udp_pcb, q, &peer->ip, peer->port, device->underlying_netif);
+	if (device->underlying_netif)
+	{
+		return udp_sendto_if(device->udp_pcb, q, &peer->ip, peer->port, device->underlying_netif);
+	}
+	return udp_sendto(device->udp_pcb, q, &peer->ip, peer->port);
 }
 
 static err_t wireguardif_device_output(struct wireguard_device *device, struct pbuf *q, const ip_addr_t *ipaddr, u16_t port)
 {
-	return udp_sendto_if(device->udp_pcb, q, ipaddr, port, device->underlying_netif);
+	if (device->underlying_netif)
+	{
+		return udp_sendto_if(device->udp_pcb, q, ipaddr, port, device->underlying_netif);
+	}
+	return udp_sendto(device->udp_pcb, q, ipaddr, port);
 }
 
 static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, const ip_addr_t *ipaddr, struct wireguard_peer *peer)
@@ -249,23 +258,21 @@ static void wireguardif_send_keepalive(struct wireguard_device *device, struct w
 
 static void wireguardif_process_response_message(struct wireguard_device *device, struct wireguard_peer *peer, struct message_handshake_response *response, const ip_addr_t *addr, u16_t port)
 {
+	char addr_str[IPADDR_STRLEN_MAX];
+	ipaddr_ntoa_r(addr, addr_str, sizeof(addr_str));
 	if (wireguard_process_handshake_response(device, peer, response))
 	{
-		// Packet is good
-		// Update the peer location
-		log_i(TAG "good handshake from %08x:%d", addr->u_addr.ip4.addr, port);
+		log_i(TAG "good handshake from [%s]:%d", addr_str, port);
 		update_peer_addr(peer, addr, port);
 
 		wireguard_start_session(peer, true);
 		wireguardif_send_keepalive(device, peer);
 
-		// Set the IF-UP flag on netif
 		netif_set_link_up(device->netif);
 	}
 	else
 	{
-		// Packet bad
-		log_i(TAG "bad handshake from %08x:%d", addr->u_addr.ip4.addr, port);
+		log_i(TAG "bad handshake from [%s]:%d", addr_str, port);
 	}
 }
 
@@ -379,7 +386,7 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 								ip_addr_copy_from_ip4(dest, iphdr->dest);
 								for (x = 0; x < WIREGUARD_MAX_SRC_IPS; x++)
 								{
-									if (peer->allowed_source_ips[x].valid)
+									if (peer->allowed_source_ips[x].valid && IP_IS_V4(&peer->allowed_source_ips[x].ip))
 									{
 										if (ip_addr_netcmp(&dest, &peer->allowed_source_ips[x].ip, ip_2_ip4(&peer->allowed_source_ips[x].mask)))
 										{
@@ -394,9 +401,8 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 #if LWIP_IPV6
 							if (IPH_V(iphdr) == 6)
 							{
-								// TODO: IPV6 support for route filtering
-								header_len = PP_NTOHS(IPH_LEN(iphdr));
-								dest_ok = true;
+								// Inner tunnel is IPv4-only; reading IPH_LEN on IPv6 would read Flow Label bytes instead of payload length
+								dest_ok = false;
 							}
 #endif /* LWIP_IPV6 */
 							if (header_len <= pbuf->tot_len)
@@ -648,91 +654,92 @@ void wireguardif_network_rx(void *arg, struct udp_pcb *pcb, struct pbuf *p, cons
 {
 	LWIP_ASSERT("wireguardif_network_rx: invalid arg", arg != NULL);
 	LWIP_ASSERT("wireguardif_network_rx: invalid pbuf", p != NULL);
-	// We have received a packet from the base_netif to our UDP port - process this as a possible Wireguard packet
 	struct wireguard_device *device = (struct wireguard_device *)arg;
 	struct wireguard_peer *peer;
+
+	// Copy addr before coalescing pbuf since lwIP docs warn addr may alias into p
+	ip_addr_t src_addr = *addr;
+	if (p->next != NULL)
+	{
+		p = pbuf_coalesce(p, PBUF_RAW);
+		if (p->next != NULL)
+		{
+			pbuf_free(p);
+			return;
+		}
+	}
+
 	uint8_t *data = p->payload;
-	size_t len = p->len; // This buf, not chained ones
+	size_t len = p->len;
 
 	struct message_handshake_initiation *msg_initiation;
 	struct message_handshake_response *msg_response;
 	struct message_cookie_reply *msg_cookie;
 	struct message_transport_data *msg_data;
 
+	char addr_str[IPADDR_STRLEN_MAX];
+	ipaddr_ntoa_r(&src_addr, addr_str, sizeof(addr_str));
+
 	uint8_t type = wireguard_get_message_type(data, len);
-	ESP_LOGV(TAG, "network_rx: %08x:%d", addr->u_addr.ip4.addr, port);
+	ESP_LOGV(TAG, "network_rx: [%s]:%d", addr_str, port);
 
 	switch (type)
 	{
 	case MESSAGE_HANDSHAKE_INITIATION:
 		msg_initiation = (struct message_handshake_initiation *)data;
-		log_i(TAG "HANDSHAKE_INITIATION: %08x:%d", addr->u_addr.ip4.addr, port);
-		// Check mac1 (and optionally mac2) are correct - note it may internally generate a cookie reply packet
-		if (wireguardif_check_initiation_message(device, msg_initiation, addr, port))
+		log_i(TAG "HANDSHAKE_INITIATION: [%s]:%d", addr_str, port);
+		if (wireguardif_check_initiation_message(device, msg_initiation, &src_addr, port))
 		{
-
 			peer = wireguard_process_initiation_message(device, msg_initiation);
 			if (peer)
 			{
-				// Update the peer location
-				update_peer_addr(peer, addr, port);
-
-				// Send back a handshake response
+				update_peer_addr(peer, &src_addr, port);
 				wireguardif_send_handshake_response(device, peer);
 			}
 		}
 		break;
 
 	case MESSAGE_HANDSHAKE_RESPONSE:
-		log_i(TAG "HANDSHAKE_RESPONSE: %08x:%d", addr->u_addr.ip4.addr, port);
+		log_i(TAG "HANDSHAKE_RESPONSE: [%s]:%d", addr_str, port);
 		msg_response = (struct message_handshake_response *)data;
 
-		// Check mac1 (and optionally mac2) are correct - note it may internally generate a cookie reply packet
-		if (wireguardif_check_response_message(device, msg_response, addr, port))
+		if (wireguardif_check_response_message(device, msg_response, &src_addr, port))
 		{
-
 			peer = peer_lookup_by_handshake(device, msg_response->receiver);
 			if (peer)
 			{
-				// Process the handshake response
-				wireguardif_process_response_message(device, peer, msg_response, addr, port);
+				wireguardif_process_response_message(device, peer, msg_response, &src_addr, port);
 			}
 		}
 		break;
 
 	case MESSAGE_COOKIE_REPLY:
-		log_i(TAG "COOKIE_REPLY: %08x:%d", addr->u_addr.ip4.addr, port);
+		log_i(TAG "COOKIE_REPLY: [%s]:%d", addr_str, port);
 		msg_cookie = (struct message_cookie_reply *)data;
 		peer = peer_lookup_by_handshake(device, msg_cookie->receiver);
 		if (peer)
 		{
 			if (wireguard_process_cookie_message(device, peer, msg_cookie))
 			{
-				// Update the peer location
-				update_peer_addr(peer, addr, port);
-
-				// Don't send anything out - we stay quiet until the next initiation message
+				update_peer_addr(peer, &src_addr, port);
 			}
 		}
 		break;
 
 	case MESSAGE_TRANSPORT_DATA:
-		ESP_LOGV(TAG, "TRANSPORT_DATA: %08x:%d", addr->u_addr.ip4.addr, port);
+		ESP_LOGV(TAG, "TRANSPORT_DATA: [%s]:%d", addr_str, port);
 
 		msg_data = (struct message_transport_data *)data;
 		peer = peer_lookup_by_receiver(device, msg_data->receiver);
 		if (peer)
 		{
-			// header is 16 bytes long so take that off the length
-			wireguardif_process_data_message(device, peer, msg_data, len - 16, addr, port);
+			wireguardif_process_data_message(device, peer, msg_data, len - 16, &src_addr, port);
 		}
 		break;
 
 	default:
-		// Unknown or bad packet header
 		break;
 	}
-	// Release data!
 	pbuf_free(p);
 }
 
@@ -746,8 +753,11 @@ static err_t wireguard_start_handshake(struct netif *netif, struct wireguard_pee
 	pbuf = wireguardif_initiate_handshake(device, peer, &msg, &result);
 	if (pbuf)
 	{
+		char addr_str[IPADDR_STRLEN_MAX];
+		ipaddr_ntoa_r(&peer->ip, addr_str, sizeof(addr_str));
+		u16_t pkt_len = pbuf->tot_len;
 		result = wireguardif_peer_output(netif, pbuf, peer);
-		log_i(TAG "start handshake %08x,%d - %d", peer->ip.u_addr.ip4.addr, peer->port, result);
+		log_i(TAG "start handshake [%s]:%d (%u bytes) - err=%d", addr_str, peer->port, pkt_len, result);
 		pbuf_free(pbuf);
 		peer->send_handshake = false;
 		peer->last_initiation_tx = wireguard_sys_now();
@@ -1116,34 +1126,45 @@ err_t wireguardif_init(struct netif *netif)
 	uint8_t private_key[WIREGUARD_PRIVATE_KEY_LEN];
 	size_t private_key_len = sizeof(private_key);
 
-	struct netif *underlying_netif;
-	underlying_netif = netif_default;
-	log_i(TAG "underlying_netif = %p", underlying_netif);
+	struct netif *underlying_netif = NULL;
 
 	LWIP_ASSERT("netif != NULL", (netif != NULL));
 	LWIP_ASSERT("state != NULL", (netif->state != NULL));
 
-	// We need to initialise the wireguard module
 	wireguard_init();
 	log_i(TAG "wireguard module initialized.");
 
 	if (netif && netif->state)
 	{
-
-		// The init data is passed into the netif_add call as the 'state' - we will replace this with our private state data
 		init_data = (struct wireguardif_init_data *)netif->state;
+		underlying_netif = init_data->bind_netif;
+		if (underlying_netif == NULL)
+		{
+			underlying_netif = netif_default;
+		}
+		if (underlying_netif == NULL)
+		{
+			struct netif *n;
+			NETIF_FOREACH(n)
+			{
+				if (n != netif && netif_is_up(n) && !(n->name[0] == 'l' && n->name[1] == 'o'))
+				{
+					underlying_netif = n;
+					break;
+				}
+			}
+		}
+		log_i(TAG "underlying_netif = %p", underlying_netif);
 
-		// Clear out and set if function is successful
 		netif->state = NULL;
 
 		if (wireguard_base64_decode(init_data->private_key, private_key, &private_key_len) && (private_key_len == WIREGUARD_PRIVATE_KEY_LEN))
 		{
-
-			udp = udp_new();
+			udp = udp_new_ip_type(IPADDR_TYPE_ANY);
 
 			if (udp)
 			{
-				result = udp_bind(udp, IP_ADDR_ANY, init_data->listen_port); // Note this listens on all interfaces! Really just want the passed netif
+				result = udp_bind(udp, IP_ANY_TYPE, init_data->listen_port);
 				if (result == ERR_OK)
 				{
 					device = (struct wireguard_device *)mem_calloc(1, sizeof(struct wireguard_device));

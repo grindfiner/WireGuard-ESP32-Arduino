@@ -41,8 +41,8 @@
 #include "lwip/netif.h"
 #include "lwip/ip_addr.h"
 
-// Default MTU for WireGuard is 1420 bytes
-#define WIREGUARDIF_MTU (1420)
+// 1360 fits 16-byte WG alignment + 32B WG + 8B UDP + 40B IPv6 (= 1440B) inside PPPoE/LTE MTUs without fragmentation
+#define WIREGUARDIF_MTU (1360)
 
 #define WIREGUARDIF_DEFAULT_PORT		(51820)
 #define WIREGUARDIF_KEEPALIVE_DEFAULT	(0xFFFF)
